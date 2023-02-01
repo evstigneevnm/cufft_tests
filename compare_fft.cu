@@ -176,16 +176,19 @@ int main(int argc, char const *argv[])
 //     CUFFT_Z2Z = 0x69   // Double-complex to T-complex (interleaved)
 // } cufftType;
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+
     CUFFT_SAFE_CALL( cufftPlan3d(&cufft_handle_r2c, N, M, L, CUFFT_D2Z) );
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, static_cast<TRealCufft*>( data_r_1_dev_c ), (TComplexCufft*)( data_c_dev_c ) ) ); //only works with C-style cast!
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());    
+    CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_r2c) );
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
     CUFFT_SAFE_CALL( cufftPlan3d(&cufft_handle_c2r, N, M, L, CUFFT_Z2D) ); 
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-    CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, static_cast<TRealCufft*>( data_r_1_dev_c ), (TComplexCufft*)( data_c_dev_c ) ) ); //only works with C-style cast!
     CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, (TComplexCufft*)( data_c_dev_c ), static_cast<TRealCufft*>( data_r_2_dev_c ) ) ); //only works with C-style cast!
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-    CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_r2c) );
     CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_c2r) );
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 

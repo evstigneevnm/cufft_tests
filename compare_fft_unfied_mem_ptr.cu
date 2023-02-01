@@ -174,12 +174,12 @@ int main(int argc, char const *argv[])
     std::size_t size_real = N*M*L;
     std::size_t size_complex = N*M*L_reduced;
 
-    CUDA_SAFE_CALL( cudaMallocManaged((void**)&data_r_1_dev, sizeof(TRealCufft)*size_real ) );
-    CUDA_SAFE_CALL( cudaMallocManaged((void**)&data_r_2_dev, sizeof(TRealCufft)*size_real ) );
-    CUDA_SAFE_CALL( cudaMallocManaged((void**)&data_c_dev, sizeof(TComplexCufft)*size_complex ) );
+    CUDA_SAFE_CALL( cudaMallocHost((void**)&data_r_1_dev, sizeof(TRealCufft)*size_real ) );
+    CUDA_SAFE_CALL( cudaMallocHost((void**)&data_r_2_dev, sizeof(TRealCufft)*size_real ) );
+    CUDA_SAFE_CALL( cudaMallocHost((void**)&data_c_dev, sizeof(TComplexCufft)*size_complex ) );
 
-    CUDA_SAFE_CALL( cudaMemcpy ( data_r_1_dev, data_r_1.data(), sizeof(TRealCufft)*size_real, cudaMemcpyHostToDevice ) );
-    CUDA_SAFE_CALL( cudaMemcpy ( data_r_2_dev, data_r_2.data(), sizeof(TRealCufft)*size_real, cudaMemcpyHostToDevice ) );
+    CUDA_SAFE_CALL( cudaMemcpy ( data_r_1_dev, data_r_1.data(), sizeof(TRealCufft)*size_real, cudaMemcpyHostToHost ) );
+    CUDA_SAFE_CALL( cudaMemcpy ( data_r_2_dev, data_r_2.data(), sizeof(TRealCufft)*size_real, cudaMemcpyHostToHost ) );
 
 
     auto data_c_dev_c = data_c_dev;
@@ -187,7 +187,7 @@ int main(int argc, char const *argv[])
     auto data_r_2_dev_c = data_r_2_dev;
     
 
-    cufftHandle cufft_handle_r2c, cufft_handle_c2r;
+    
 
     cudaEvent_t start_1, stop_1;
     CUDA_SAFE_CALL( cudaEventCreate(&start_1) );
@@ -196,18 +196,32 @@ int main(int argc, char const *argv[])
     CUDA_SAFE_CALL( cudaEventRecord(start_1) );
     CUDA_SAFE_CALL( cudaDeviceSynchronize() );
 
-    CUFFT_SAFE_CALL( cufftPlan3d(&cufft_handle_r2c, N, M, L, CUFFT_D2Z) );
-    CUDA_SAFE_CALL( cudaDeviceSynchronize() );
-    CUFFT_SAFE_CALL( cufftPlan3d(&cufft_handle_c2r, N, M, L, CUFFT_Z2D) ); 
-    CUDA_SAFE_CALL( cudaDeviceSynchronize() );
-
-    CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, data_r_1_dev_c, data_c_dev_c ) ); //only works with C-style cast!
-    CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, data_c_dev_c, data_r_2_dev_c ) ); //only works with C-style cast!
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-    CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_r2c) );
-    CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_c2r) );
-    CUDA_SAFE_CALL( cudaDeviceSynchronize() );
+    {
+        cufftHandle cufft_handle_r2c;
+        std::cout << "start plan D2Z" << std::endl;
+        CUFFT_SAFE_CALL( cufftPlan3d(&cufft_handle_r2c, N, M, L, CUFFT_D2Z) );
+        CUDA_SAFE_CALL( cudaDeviceSynchronize() );
+        std::cout << "execute D2Z" << std::endl;
+        CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, data_r_1_dev_c, data_c_dev_c ) ); //only works with C-style cast!
+        CUDA_SAFE_CALL( cudaDeviceSynchronize() );
+        std::cout << "distroy D2Z" << std::endl;
+        CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_r2c) );
+        CUDA_SAFE_CALL( cudaDeviceSynchronize() );
+        std::cout << "done" << std::endl;
+    }
+    {
+        cufftHandle cufft_handle_c2r;
+        std::cout << "start plan Z2D" << std::endl;
+        CUFFT_SAFE_CALL( cufftPlan3d(&cufft_handle_c2r, N, M, L, CUFFT_Z2D) ); 
+        CUDA_SAFE_CALL( cudaDeviceSynchronize() );
+        std::cout << "execute Z2D" << std::endl;
+        CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, data_c_dev_c, data_r_2_dev_c ) ); //only works with C-style cast!
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        std::cout << "distroy Z2D" << std::endl;
+        CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_c2r) );
+        CUDA_SAFE_CALL( cudaDeviceSynchronize() );
+        std::cout << "done" << std::endl;
+    }
 
     CUDA_SAFE_CALL( cudaEventRecord(stop_1) );
     CUDA_SAFE_CALL( cudaEventSynchronize(stop_1) );
@@ -222,9 +236,9 @@ int main(int argc, char const *argv[])
 
 
 
-    cudaFree(data_r_1_dev);
-    cudaFree(data_r_2_dev);
-    cudaFree(data_c_dev);
+    cudaFreeHost(data_r_1_dev);
+    cudaFreeHost(data_r_2_dev);
+    cudaFreeHost(data_c_dev);
 
 
 

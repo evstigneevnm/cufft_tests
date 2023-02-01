@@ -13,6 +13,8 @@
 #include "cuda_safe_call.h"
 #include "cufft_safe_call.h"
 #include <chrono>
+#include <execution>
+
 
 template<typename T>
 T norm(const std::vector<T>& data)
@@ -119,16 +121,19 @@ int main(int argc, char const *argv[])
     std::vector< T > data_r_1(N*M*L);
     std::vector< T > data_r_2(N*M*L);
 
-    std::random_device rd;
-    std::mt19937 engine{ rd() }; 
-    std::uniform_real_distribution<> dist(0.0, 100.0);
 
-    auto gen_rand = [&dist, &engine]()
+    std::cout << "initializing vector of randoms" << std::endl;
     {
-        return dist(engine);
-    };
-    std::generate(begin(data_r_1), end(data_r_1), gen_rand);
-    
+        std::random_device rd;
+        std::mt19937 engine{ rd() }; 
+        std::uniform_real_distribution<> dist(-100.0, 100.0);
+
+        auto gen_rand = [&dist, &engine]()
+        {
+            return dist(engine);
+        };        
+        std::generate(std::execution::par, begin(data_r_1), end(data_r_1), gen_rand);
+    }
     //timers
  
     //FFTW part
@@ -165,14 +170,6 @@ int main(int argc, char const *argv[])
     std::cout << "executing cufft...";
     std::cout << std::flush;
 
-    thrust::universal_vector< T > data_r_1_dev(data_r_1); //input vector copy to device
-
-    thrust::universal_vector< thrust::complex<T> > data_c_dev(N*M*L_reduced);
-    thrust::universal_vector< T > data_r_2_dev(data_r_2);
-
-    auto data_c_dev_c = thrust::raw_pointer_cast( data_c_dev.data() );
-    auto data_r_1_dev_c = thrust::raw_pointer_cast( data_r_1_dev.data() );
-    auto data_r_2_dev_c = thrust::raw_pointer_cast( data_r_2_dev.data() );
     
 
     cufftHandle cufft_handle_r2c, cufft_handle_c2r;
@@ -180,26 +177,50 @@ int main(int argc, char const *argv[])
     cudaEvent_t start_1, stop_1;
     CUDA_SAFE_CALL(cudaEventCreate(&start_1));
     CUDA_SAFE_CALL(cudaEventCreate(&stop_1));    
-
     CUDA_SAFE_CALL(cudaEventRecord(start_1));
-// typedef enum cufftType_t {
-//     CUFFT_R2C = 0x2a,  // Real to complex (interleaved) 
-//     CUFFT_C2R = 0x2c,  // Complex (interleaved) to real 
-//     CUFFT_C2C = 0x29,  // Complex to complex (interleaved) 
-//     CUFFT_D2Z = 0x6a,  // T to T-complex (interleaved) 
-//     CUFFT_Z2D = 0x6c,  // T-complex (interleaved) to T 
-//     CUFFT_Z2Z = 0x69   // T-complex to T-complex (interleaved)
-// } cufftType;
 
-    CUFFT_SAFE_CALL( cufftPlan3d(&cufft_handle_r2c, N, M, L, CUFFT_D2Z) );
+    CUFFT_SAFE_CALL(cufftCreate(&cufft_handle_r2c));
+    CUFFT_SAFE_CALL(cufftCreate(&cufft_handle_c2r));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+// We ask cuFFT to not allocate any buffers automatically
+    CUFFT_SAFE_CALL(cufftSetAutoAllocation(cufft_handle_r2c, false));
+    CUFFT_SAFE_CALL(cufftSetAutoAllocation(cufft_handle_c2r, false));
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+// estimate buffer sizes
+    std::size_t scratch_sizes[2];
+    CUFFT_SAFE_CALL(cufftMakePlan3d(cufft_handle_r2c, N, M, L, CUFFT_D2Z, &scratch_sizes[0]));
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    CUFFT_SAFE_CALL(cufftMakePlan3d(cufft_handle_c2r, N, M, L, CUFFT_Z2D, &scratch_sizes[1]));
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    double to_gb = 1.0/(1024.0*1024.0*1024.0);
+    std::cout << "D2Z buffer size = " << scratch_sizes[0]*to_gb << "GB, Z2D buffer size = " << scratch_sizes[1]*to_gb << "GB." << std::endl;
+    std::size_t bufer_size = scratch_sizes[0]>scratch_sizes[1]?scratch_sizes[0]:scratch_sizes[1];
+
+// allocating buffer size
+    thrust::universal_vector< T > buffer_dev(bufer_size);
+    auto buffer_dev_c = thrust::raw_pointer_cast( buffer_dev.data() );
+    CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_r2c, buffer_dev_c));
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_c2r, buffer_dev_c));
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    std::cout << "buffer for cufft allocated" << std::endl;
+
+    thrust::universal_vector< T > data_r_1_dev(data_r_1); //input vector copy to device
+    thrust::universal_vector< thrust::complex<T> > data_c_dev(N*M*L_reduced);
+    thrust::universal_vector< T > data_r_2_dev(data_r_2);
+
+    auto data_c_dev_c = thrust::raw_pointer_cast( data_c_dev.data() );
+    auto data_r_1_dev_c = thrust::raw_pointer_cast( data_r_1_dev.data() );
+    auto data_r_2_dev_c = thrust::raw_pointer_cast( data_r_2_dev.data() );
+
+    std::cout << "D2Z execution" << std::endl;
     CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, static_cast<TRealCufft*>( data_r_1_dev_c ), (TComplexCufft*)( data_c_dev_c ) ) ); //only works with C-style cast!
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_r2c) );
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-    CUFFT_SAFE_CALL( cufftPlan3d(&cufft_handle_c2r, N, M, L, CUFFT_Z2D) ); 
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    std::cout << "Z2D execution" << std::endl;
     CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, (TComplexCufft*)( data_c_dev_c ), static_cast<TRealCufft*>( data_r_2_dev_c ) ) ); //only works with C-style cast!
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_c2r) );
@@ -209,10 +230,7 @@ int main(int argc, char const *argv[])
     CUDA_SAFE_CALL(cudaEventSynchronize(stop_1));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-    std::cout << "done." << std::endl;
-
-    //check diff
-    thrust::host_vector< thrust::complex<T> > data_c_host(data_c_dev);
+    std::cout << "cufft done." << std::endl;
 
     float duration_1 = 0;
     CUDA_SAFE_CALL(cudaEventElapsedTime(&duration_1, start_1, stop_1));
@@ -220,52 +238,54 @@ int main(int argc, char const *argv[])
     std::cout << " fftw time = " << duration_0.count() << " cufft time = " << duration_1 << std::endl;
     
 
-
-    //thrust::host_vector< T > data_r_2_host(data_r_2_dev);
-    
-    auto data_r_2_host = device_to_std_vec(data_r_2_dev);
-
-    std::vector<T> data_r_2_from_cuda(N*M*L);
-
-    device_to_std_vec(data_r_2_dev, data_r_2_from_cuda);
-
-
-    //plot_vec(data_c);
-    //std::cout << "..." << std::endl;
-    //plot_vec(data_c_host);
-
-
-    std::transform(data_r_2_host.cbegin(), data_r_2_host.cend(), data_r_2_host.begin(), [&N, &M, &L]( T c) { return c/(N*M*L); });  
-
-
-    std::vector< std::complex<T> > diff_c_cufft_vs_fftw(N*M*L_reduced);
-    std::transform(data_c.begin(), data_c.end(), data_c_host.begin(), diff_c_cufft_vs_fftw.begin(), [](auto c, auto d){ return static_cast<std::complex<T> >(c) - static_cast<std::complex<T> >(d); } );
-
-    auto c_diff = norm(diff_c_cufft_vs_fftw);  
-    std::cout << "cufft vs fftw complex difference: " << c_diff << std::endl;
-    if (c_diff/(N*M*L)>1.0e-10)
+    if(use_fftw == 'y')
     {
-        std::cout << "fftw(u(0)) = " << data_c[0] << " cufft(u(0)) = " << data_c_host[0] << std::endl;
+        //thrust::host_vector< T > data_r_2_host(data_r_2_dev);
+        //check diff
+        thrust::host_vector< thrust::complex<T> > data_c_host(data_c_dev);        
+        auto data_r_2_host = device_to_std_vec(data_r_2_dev);
+
+        std::vector<T> data_r_2_from_cuda(N*M*L);
+
+        device_to_std_vec(data_r_2_dev, data_r_2_from_cuda);
+
+
+        //plot_vec(data_c);
+        //std::cout << "..." << std::endl;
+        //plot_vec(data_c_host);
+
+
+        std::transform(data_r_2_host.cbegin(), data_r_2_host.cend(), data_r_2_host.begin(), [&N, &M, &L]( T c) { return c/(N*M*L); });  
+
+
+        std::vector< std::complex<T> > diff_c_cufft_vs_fftw(N*M*L_reduced);
+        std::transform(data_c.begin(), data_c.end(), data_c_host.begin(), diff_c_cufft_vs_fftw.begin(), [](auto c, auto d){ return static_cast<std::complex<T> >(c) - static_cast<std::complex<T> >(d); } );
+
+        auto c_diff = norm(diff_c_cufft_vs_fftw);  
+        std::cout << "cufft vs fftw complex difference: " << c_diff << std::endl;
+        if (c_diff/(N*M*L)>1.0e-10)
+        {
+            std::cout << "fftw(u(0)) = " << data_c[0] << " cufft(u(0)) = " << data_c_host[0] << std::endl;
+        }
+
+
+
+        std::vector<T> diff_r_fftw(N*M*L);
+        std::transform(data_r_1.begin(), data_r_1.end(), data_r_2.begin(), diff_r_fftw.begin(), std::minus< T >() );
+        std::vector<T> diff_r_cufft(N*M*L);
+        std::transform(data_r_1.begin(), data_r_1.end(), data_r_2_host.begin(), diff_r_cufft.begin(), std::minus< T >() );
+
+        std::vector<T> diff_r_fftw_vs_cufft(N*M*L);
+         std::transform(data_r_2.begin(), data_r_2.end(), data_r_2_host.begin(), diff_r_fftw_vs_cufft.begin(), std::minus< T >() );   
+        
+
+        std::cout << "fftw complex vector norm: " << norm(data_c) << std::endl;
+
+        std::cout << "fftw result difference: " << norm(diff_r_fftw) << std::endl;
+        std::cout << "cufft result difference: " << norm(diff_r_cufft) << std::endl;
+        std::cout << "cufft vs fftw result difference: " << norm(diff_r_fftw_vs_cufft) << std::endl;
+
     }
-
-
-
-    std::vector<T> diff_r_fftw(N*M*L);
-    std::transform(data_r_1.begin(), data_r_1.end(), data_r_2.begin(), diff_r_fftw.begin(), std::minus< T >() );
-    std::vector<T> diff_r_cufft(N*M*L);
-    std::transform(data_r_1.begin(), data_r_1.end(), data_r_2_host.begin(), diff_r_cufft.begin(), std::minus< T >() );
-
-    std::vector<T> diff_r_fftw_vs_cufft(N*M*L);
-     std::transform(data_r_2.begin(), data_r_2.end(), data_r_2_host.begin(), diff_r_fftw_vs_cufft.begin(), std::minus< T >() );   
-    
-
-    std::cout << "fftw complex vector norm: " << norm(data_c) << std::endl;
-
-    std::cout << "fftw result difference: " << norm(diff_r_fftw) << std::endl;
-    std::cout << "cufft result difference: " << norm(diff_r_cufft) << std::endl;
-    std::cout << "cufft vs fftw result difference: " << norm(diff_r_fftw_vs_cufft) << std::endl;
-
-
 
     return 0;
 
