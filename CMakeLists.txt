@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 set(project_name fft_tests)
 project(${project_name} LANGUAGES CUDA CXX)
 set(CMAKE_CUDA_ARCHITECTURES 35 52 61 70 75 80)
