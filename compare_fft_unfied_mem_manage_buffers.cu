@@ -14,6 +14,10 @@
 #include "cufft_safe_call.h"
 #include <chrono>
 #include <execution>
+#include <fstream>
+#include <string>
+#include <ios>
+#include <unistd.h>
 
 
 template<typename T>
@@ -76,6 +80,51 @@ std::vector< typename VecDev::value_type > device_to_std_vec(const VecDev& vec_d
     return vec_h; 
 }
 
+
+class memory_info
+{
+public:
+    memory_info()
+    {}
+    ~memory_info(){}
+
+    void print_mem(const std::string& mem_ = "")
+    {
+        get_current_memory();
+        std::cout << "MEM " << mem_ << ": host = " << host_occupied_mem_in_kB << "kB, device = " << device_occupied_mem_in_kB << "kB, total = " << host_occupied_mem_in_kB+device_occupied_mem_in_kB << "kB." << std::endl;
+    }
+
+
+private:
+    std::string pid, comm, state, ppid, pgrp, session, tty_nr;
+    std::string tpgid, flags, minflt, cminflt, majflt, cmajflt;
+    std::string utime, stime, cutime, cstime, priority, nice;
+    std::string O, itrealvalue, starttime, vsize;
+    cudaDeviceProp device_prop;
+    std::size_t rss;
+    std::size_t host_occupied_mem_in_kB;
+    std::size_t device_free_mem, device_total_mem, device_occupied_mem_in_kB;
+    std::size_t page_size_kb = sysconf(_SC_PAGE_SIZE)/1024; //in kB, usually 2MB per page
+
+    void get_current_memory()
+    {
+        std::ifstream stat_stream("/proc/self/stat", std::ios_base::in);
+        stat_stream >> pid >> comm >> state >> ppid >> pgrp >> session >> tty_nr
+           >> tpgid >> flags >> minflt >> cminflt >> majflt >> cmajflt
+           >> utime >> stime >> cutime >> cstime >> priority >> nice
+           >> O >> itrealvalue >> starttime >> vsize >> rss;
+        stat_stream.close();
+        CUDA_SAFE_CALL( cudaMemGetInfo ( &device_free_mem, &device_total_mem ) ); 
+        CUDA_SAFE_CALL( cudaDeviceSynchronize() );
+        host_occupied_mem_in_kB = rss*page_size_kb;
+        device_occupied_mem_in_kB = (device_total_mem - device_free_mem)/1024;
+
+    }
+
+};
+
+
+
 template<typename T>
 struct select_cufft_type
 {
@@ -106,13 +155,13 @@ int main(int argc, char const *argv[])
         std::cout << "  CPU=y/n is use CPU fftw for verification or not." << std::endl;
         return 0;
     }
-    int device_id = std::atoi(argv[3]);
+    int device_id = std::stoi(argv[3]);
     cudaDeviceProp device_prop;
     CUDA_SAFE_CALL( cudaGetDeviceProperties(&device_prop, device_id) );     
     std::cout << "using CUDA device number " << device_id << ": " << device_prop.name << std::endl;
     CUDA_SAFE_CALL( cudaSetDevice(device_id) );
 
-    std::size_t N_size = std::atoi(argv[1]);
+    std::size_t N_size = std::stoi(argv[1]);
     char use_fftw = argv[2][0];
     std::size_t N = N_size, M = N_size, L = N_size;
     std::size_t L_reduced = L/2+1; 
@@ -121,8 +170,11 @@ int main(int argc, char const *argv[])
     std::vector< T > data_r_1(N*M*L);
     std::vector< T > data_r_2(N*M*L);
 
+    memory_info mem;
 
     std::cout << "initializing vector of randoms" << std::endl;
+    mem.print_mem();
+
     {
         std::random_device rd;
         std::mt19937 engine{ rd() }; 
@@ -138,8 +190,9 @@ int main(int argc, char const *argv[])
  
     //FFTW part
 
-    
+        
     std::cout << "executing fftw...";
+    mem.print_mem();
     std::cout << std::flush;
 
     fftw_complex* c_fftw = (fftw_complex*)( data_c.data() );
@@ -174,6 +227,7 @@ int main(int argc, char const *argv[])
 
     cufftHandle cufft_handle_r2c, cufft_handle_c2r;
 
+    mem.print_mem("starting cuda");
     cudaEvent_t start_1, stop_1;
     CUDA_SAFE_CALL(cudaEventCreate(&start_1));
     CUDA_SAFE_CALL(cudaEventCreate(&stop_1));    
@@ -182,6 +236,7 @@ int main(int argc, char const *argv[])
     CUFFT_SAFE_CALL(cufftCreate(&cufft_handle_r2c));
     CUFFT_SAFE_CALL(cufftCreate(&cufft_handle_c2r));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
 
 // We ask cuFFT to not allocate any buffers automatically
     CUFFT_SAFE_CALL(cufftSetAutoAllocation(cufft_handle_r2c, false));
@@ -206,31 +261,41 @@ int main(int argc, char const *argv[])
     CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_c2r, buffer_dev_c));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
     std::cout << "buffer for cufft allocated" << std::endl;
+    mem.print_mem();
+
 
     thrust::universal_vector< T > data_r_1_dev(data_r_1); //input vector copy to device
     thrust::universal_vector< thrust::complex<T> > data_c_dev(N*M*L_reduced);
     thrust::universal_vector< T > data_r_2_dev(data_r_2);
 
+    mem.print_mem("device vectors allocated");
     auto data_c_dev_c = thrust::raw_pointer_cast( data_c_dev.data() );
     auto data_r_1_dev_c = thrust::raw_pointer_cast( data_r_1_dev.data() );
     auto data_r_2_dev_c = thrust::raw_pointer_cast( data_r_2_dev.data() );
 
-    std::cout << "D2Z execution" << std::endl;
-    CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, static_cast<TRealCufft*>( data_r_1_dev_c ), (TComplexCufft*)( data_c_dev_c ) ) ); //only works with C-style cast!
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    
+    for(int j=0;j<100;j++)
+    {
+        std::cout << "D2Z execution" << std::endl;
+        CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, static_cast<TRealCufft*>( data_r_1_dev_c ), (TComplexCufft*)( data_c_dev_c ) ) ); //only works with C-style cast!
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        std::cout << "Z2D execution" << std::endl;
+        CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, (TComplexCufft*)( data_c_dev_c ), static_cast<TRealCufft*>( data_r_2_dev_c ) ) ); //only works with C-style cast!
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        mem.print_mem("iteration " + std::to_string(j) );
+    }
+
     CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_r2c) );
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    std::cout << "Z2D execution" << std::endl;
-    CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, (TComplexCufft*)( data_c_dev_c ), static_cast<TRealCufft*>( data_r_2_dev_c ) ) ); //only works with C-style cast!
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
     CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_c2r) );
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
 
     CUDA_SAFE_CALL(cudaEventRecord(stop_1));
     CUDA_SAFE_CALL(cudaEventSynchronize(stop_1));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     std::cout << "cufft done." << std::endl;
+    mem.print_mem();
 
     float duration_1 = 0;
     CUDA_SAFE_CALL(cudaEventElapsedTime(&duration_1, start_1, stop_1));
