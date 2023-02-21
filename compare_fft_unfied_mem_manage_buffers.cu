@@ -124,6 +124,50 @@ private:
 };
 
 
+template<class T>
+class cuda_universal_vector
+{
+public:
+    cuda_universal_vector(){};
+    cuda_universal_vector(std::size_t size):
+    size_(size)
+    {
+        CUDA_SAFE_CALL( cudaMallocManaged((void**)&data, sizeof(T)*size_) );
+    }
+    ~cuda_universal_vector()
+    {
+        if(data != nullptr)
+        {
+            cudaFree(data);
+        }
+    }
+    void init(std::size_t size)
+    {
+        if(size_ == 0)
+        {
+            size_ = size;
+            CUDA_SAFE_CALL( cudaMallocManaged((void**)&data, sizeof(T)*size_) );
+        }
+    }
+    T* raw_ptr()
+    {
+        return data;
+    }
+    void copy_to_this_vector(const T* other)
+    {
+        CUDA_SAFE_CALL( cudaMemcpy(data, other, sizeof(T)*size_, cudaMemcpyHostToDevice ) );
+    }
+    void copy_from_this_vector(T* other)
+    {
+        CUDA_SAFE_CALL( cudaMemcpy(other, data, sizeof(T)*size_, cudaMemcpyDeviceToHost ) );
+    }
+
+private:
+    T* data = nullptr;
+    std::size_t size_ = 0;
+
+};
+
 
 template<typename T>
 struct select_cufft_type
@@ -148,11 +192,12 @@ int main(int argc, char const *argv[])
     using TRealCufft = select_cufft_type<T>::real;
     using TComplexCufft = select_cufft_type<T>::complex;
 
-    if(argc != 4)
+    if(argc != 5)
     {
-        std::cout << "usage: " << argv[0] << " N CPU GPU_number" << std::endl;
+        std::cout << "usage: " << argv[0] << " N CPU GPU_number use_thrust_universal_vector" << std::endl;
         std::cout << "  where N is the size of a cube," << std::endl;
-        std::cout << "  CPU=y/n is use CPU fftw for verification or not." << std::endl;
+        std::cout << "  CPU=y/n is the use of CPU fftw for verification or not." << std::endl;
+        std::cout << "  use_thrust_universal_vector=y/n is the use of thrust::universal_vector ('y') or cudaMallocManaged ('n')." << std::endl;
         return 0;
     }
     int device_id = std::stoi(argv[3]);
@@ -163,6 +208,7 @@ int main(int argc, char const *argv[])
 
     std::size_t N_size = std::stoi(argv[1]);
     char use_fftw = argv[2][0];
+    char use_thrust_for_cuda_data = argv[4][0];
     std::size_t N = N_size, M = N_size, L = N_size;
     std::size_t L_reduced = L/2+1; 
 
@@ -254,35 +300,86 @@ int main(int argc, char const *argv[])
     std::size_t bufer_size = scratch_sizes[0]>scratch_sizes[1]?scratch_sizes[0]:scratch_sizes[1];
 
 // allocating buffer size
-    thrust::universal_vector< T > buffer_dev(bufer_size);
-    auto buffer_dev_c = thrust::raw_pointer_cast( buffer_dev.data() );
-    CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_r2c, buffer_dev_c));
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_c2r, buffer_dev_c));
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    std::cout << "buffer for cufft allocated" << std::endl;
+    thrust::universal_vector< T > buffer_dev_1;
+    cuda_universal_vector< T > buffer_dev_2;
+
+    if(use_thrust_for_cuda_data == 'y')
+    {
+        buffer_dev_1 = thrust::universal_vector< T >(bufer_size);
+        auto buffer_dev_c = thrust::raw_pointer_cast( buffer_dev_1.data() );
+
+        CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_r2c, buffer_dev_c));
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_c2r, buffer_dev_c));
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        std::cout << "buffer for cufft allocated" << std::endl;        
+    }
+    else
+    {
+        buffer_dev_2.init(bufer_size);
+        auto buffer_dev_c = buffer_dev_2.raw_ptr();
+
+        CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_r2c, buffer_dev_c));
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        CUFFT_SAFE_CALL(cufftSetWorkArea(cufft_handle_c2r, buffer_dev_c));
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        std::cout << "buffer for cufft allocated" << std::endl;          
+    }
+    
+
     mem.print_mem();
 
-
-    thrust::universal_vector< T > data_r_1_dev(data_r_1); //input vector copy to device
-    thrust::universal_vector< thrust::complex<T> > data_c_dev(N*M*L_reduced);
-    thrust::universal_vector< T > data_r_2_dev(data_r_2);
-
-    mem.print_mem("device vectors allocated");
-    auto data_c_dev_c = thrust::raw_pointer_cast( data_c_dev.data() );
-    auto data_r_1_dev_c = thrust::raw_pointer_cast( data_r_1_dev.data() );
-    auto data_r_2_dev_c = thrust::raw_pointer_cast( data_r_2_dev.data() );
-
-    
-    for(int j=0;j<100;j++)
+    if(use_thrust_for_cuda_data == 'y')
     {
-        std::cout << "D2Z execution" << std::endl;
-        CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, static_cast<TRealCufft*>( data_r_1_dev_c ), (TComplexCufft*)( data_c_dev_c ) ) ); //only works with C-style cast!
+        thrust::universal_vector< T > data_r_1_dev(data_r_1); //input vector copy to device
+        thrust::universal_vector< thrust::complex<T> > data_c_dev(N*M*L_reduced);
+        thrust::universal_vector< T > data_r_2_dev(data_r_2);
+        auto data_c_dev_c = thrust::raw_pointer_cast( data_c_dev.data() );
+        auto data_r_1_dev_c = thrust::raw_pointer_cast( data_r_1_dev.data() );
+        auto data_r_2_dev_c = thrust::raw_pointer_cast( data_r_2_dev.data() );
         CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        std::cout << "Z2D execution" << std::endl;
-        CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, (TComplexCufft*)( data_c_dev_c ), static_cast<TRealCufft*>( data_r_2_dev_c ) ) ); //only works with C-style cast!
+        mem.print_mem("thrust device vectors allocated");
+
+        
+        for(int j=0;j<100;j++)
+        {
+            std::cout << "D2Z execution" << std::endl;
+            CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, static_cast<TRealCufft*>( data_r_1_dev_c ), (TComplexCufft*)( data_c_dev_c ) ) ); //only works with C-style cast!
+            CUDA_SAFE_CALL(cudaDeviceSynchronize());
+            std::cout << "Z2D execution" << std::endl;
+            CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, (TComplexCufft*)( data_c_dev_c ), static_cast<TRealCufft*>( data_r_2_dev_c ) ) ); //only works with C-style cast!
+            CUDA_SAFE_CALL(cudaDeviceSynchronize());
+            mem.print_mem("thrust it: " + std::to_string(j) );
+        }
+    }
+    else
+    {
+        cuda_universal_vector< T > data_r_1_dev(N*M*L); //input vector copy to device
+        data_r_1_dev.copy_to_this_vector( data_r_1.data() );
+
+        cuda_universal_vector< TComplexCufft > data_c_dev(N*M*L_reduced);
+
+        cuda_universal_vector< T > data_r_2_dev(N*M*L);
+        data_r_2_dev.copy_to_this_vector( data_r_2.data() );
+
+        auto data_c_dev_c = data_c_dev.raw_ptr() ;
+        auto data_r_1_dev_c = data_r_1_dev.raw_ptr();
+        auto data_r_2_dev_c = data_r_2_dev.raw_ptr();
         CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        mem.print_mem("iteration " + std::to_string(j) );
+
+        mem.print_mem("cuda device vectors allocated");
+
+        
+        for(int j=0;j<100;j++)
+        {
+            std::cout << "D2Z execution" << std::endl;
+            CUFFT_SAFE_CALL( cufftExecD2Z(cufft_handle_r2c, data_r_1_dev_c, data_c_dev_c  ) ); //only works with C-style cast!
+            CUDA_SAFE_CALL(cudaDeviceSynchronize());
+            std::cout << "Z2D execution" << std::endl;
+            CUFFT_SAFE_CALL( cufftExecZ2D(cufft_handle_c2r, data_c_dev_c , data_r_2_dev_c ) ); //only works with C-style cast!
+            CUDA_SAFE_CALL(cudaDeviceSynchronize());
+            mem.print_mem("cuda it: " + std::to_string(j) );
+        }        
     }
 
     CUFFT_SAFE_CALL( cufftDestroy(cufft_handle_r2c) );
@@ -303,52 +400,52 @@ int main(int argc, char const *argv[])
     std::cout << " fftw time = " << duration_0.count() << " cufft time = " << duration_1 << std::endl;
     
 
-    if(use_fftw == 'y')
+    if((use_fftw == 'y')&&(use_thrust_for_cuda_data == 'y'))
     {
         //thrust::host_vector< T > data_r_2_host(data_r_2_dev);
         //check diff
-        thrust::host_vector< thrust::complex<T> > data_c_host(data_c_dev);        
-        auto data_r_2_host = device_to_std_vec(data_r_2_dev);
+        // thrust::host_vector< thrust::complex<T> > data_c_host(data_c_dev);        
+        // auto data_r_2_host = device_to_std_vec(data_r_2_dev);
 
-        std::vector<T> data_r_2_from_cuda(N*M*L);
+        // std::vector<T> data_r_2_from_cuda(N*M*L);
 
-        device_to_std_vec(data_r_2_dev, data_r_2_from_cuda);
-
-
-        //plot_vec(data_c);
-        //std::cout << "..." << std::endl;
-        //plot_vec(data_c_host);
+        // device_to_std_vec(data_r_2_dev, data_r_2_from_cuda);
 
 
-        std::transform(data_r_2_host.cbegin(), data_r_2_host.cend(), data_r_2_host.begin(), [&N, &M, &L]( T c) { return c/(N*M*L); });  
+        // //plot_vec(data_c);
+        // //std::cout << "..." << std::endl;
+        // //plot_vec(data_c_host);
 
 
-        std::vector< std::complex<T> > diff_c_cufft_vs_fftw(N*M*L_reduced);
-        std::transform(data_c.begin(), data_c.end(), data_c_host.begin(), diff_c_cufft_vs_fftw.begin(), [](auto c, auto d){ return static_cast<std::complex<T> >(c) - static_cast<std::complex<T> >(d); } );
-
-        auto c_diff = norm(diff_c_cufft_vs_fftw);  
-        std::cout << "cufft vs fftw complex difference: " << c_diff << std::endl;
-        if (c_diff/(N*M*L)>1.0e-10)
-        {
-            std::cout << "fftw(u(0)) = " << data_c[0] << " cufft(u(0)) = " << data_c_host[0] << std::endl;
-        }
+        // std::transform(data_r_2_host.cbegin(), data_r_2_host.cend(), data_r_2_host.begin(), [&N, &M, &L]( T c) { return c/(N*M*L); });  
 
 
+        // std::vector< std::complex<T> > diff_c_cufft_vs_fftw(N*M*L_reduced);
+        // std::transform(data_c.begin(), data_c.end(), data_c_host.begin(), diff_c_cufft_vs_fftw.begin(), [](auto c, auto d){ return static_cast<std::complex<T> >(c) - static_cast<std::complex<T> >(d); } );
 
-        std::vector<T> diff_r_fftw(N*M*L);
-        std::transform(data_r_1.begin(), data_r_1.end(), data_r_2.begin(), diff_r_fftw.begin(), std::minus< T >() );
-        std::vector<T> diff_r_cufft(N*M*L);
-        std::transform(data_r_1.begin(), data_r_1.end(), data_r_2_host.begin(), diff_r_cufft.begin(), std::minus< T >() );
+        // auto c_diff = norm(diff_c_cufft_vs_fftw);  
+        // std::cout << "cufft vs fftw complex difference: " << c_diff << std::endl;
+        // if (c_diff/(N*M*L)>1.0e-10)
+        // {
+        //     std::cout << "fftw(u(0)) = " << data_c[0] << " cufft(u(0)) = " << data_c_host[0] << std::endl;
+        // }
 
-        std::vector<T> diff_r_fftw_vs_cufft(N*M*L);
-         std::transform(data_r_2.begin(), data_r_2.end(), data_r_2_host.begin(), diff_r_fftw_vs_cufft.begin(), std::minus< T >() );   
+
+
+        // std::vector<T> diff_r_fftw(N*M*L);
+        // std::transform(data_r_1.begin(), data_r_1.end(), data_r_2.begin(), diff_r_fftw.begin(), std::minus< T >() );
+        // std::vector<T> diff_r_cufft(N*M*L);
+        // std::transform(data_r_1.begin(), data_r_1.end(), data_r_2_host.begin(), diff_r_cufft.begin(), std::minus< T >() );
+
+        // std::vector<T> diff_r_fftw_vs_cufft(N*M*L);
+        //  std::transform(data_r_2.begin(), data_r_2.end(), data_r_2_host.begin(), diff_r_fftw_vs_cufft.begin(), std::minus< T >() );   
         
 
-        std::cout << "fftw complex vector norm: " << norm(data_c) << std::endl;
+        // std::cout << "fftw complex vector norm: " << norm(data_c) << std::endl;
 
-        std::cout << "fftw result difference: " << norm(diff_r_fftw) << std::endl;
-        std::cout << "cufft result difference: " << norm(diff_r_cufft) << std::endl;
-        std::cout << "cufft vs fftw result difference: " << norm(diff_r_fftw_vs_cufft) << std::endl;
+        // std::cout << "fftw result difference: " << norm(diff_r_fftw) << std::endl;
+        // std::cout << "cufft result difference: " << norm(diff_r_cufft) << std::endl;
+        // std::cout << "cufft vs fftw result difference: " << norm(diff_r_fftw_vs_cufft) << std::endl;
 
     }
 
